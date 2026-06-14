@@ -308,41 +308,113 @@ export class Game extends Component {
             }
     }
 
+    /* Return a brightened / darkened copy of a colour (factor < 1 darkens). */
+    private shade(c: Color, f: number): Color {
+        const cl = (v: number) => Math.max(0, Math.min(255, Math.round(v)));
+        return new Color(cl(c.r * f), cl(c.g * f), cl(c.b * f), 255);
+    }
+
+    /* Build a path (via `build`) and stroke it once with the given colour/width.
+     * Each call is a self-contained path, so we can layer several passes
+     * (casing outline -> body -> gloss highlight) to get a defined tube look. */
+    private strokeShape(g: Graphics, color: Color, width: number, round: boolean, build: () => void) {
+        g.lineWidth = width;
+        // BUTT (flat) ends let two pipes meet flush at a tile boundary -> a clean,
+        // continuous tube with no rounded-cap blob at the joint. ROUND is only used
+        // for the inner gloss highlight, which stops short of the joint.
+        g.lineCap = round ? Graphics.LineCap.ROUND : Graphics.LineCap.BUTT;
+        g.lineJoin = Graphics.LineJoin.ROUND;
+        g.strokeColor = color;
+        build();
+        g.stroke();
+    }
+
     private drawTile(t: Tile, lit: boolean) {
         const g = t.gfx;
         const half = this.TILE / 2;
         g.clear();
 
-        // cell background socket
+        // ---- cell background socket (rounded tile with a beveled edge) ----
         g.fillColor = this.C_CELL;
-        g.roundRect(-half, -half, this.TILE, this.TILE, 14);
+        g.roundRect(-half, -half, this.TILE, this.TILE, 16);
         g.fill();
+        // darker inset border -> gives the socket depth
+        g.lineWidth = 3;
+        g.lineJoin = Graphics.LineJoin.ROUND;
+        g.strokeColor = this.shade(this.C_CELL, 0.6);
+        g.roundRect(-half + 1.5, -half + 1.5, this.TILE - 3, this.TILE - 3, 15);
+        g.stroke();
+        // soft top-edge highlight -> subtle bevel
+        g.lineWidth = 2.5;
+        g.lineCap = Graphics.LineCap.ROUND;
+        g.strokeColor = this.shade(this.C_CELL, 1.35);
+        g.moveTo(-half + 16, half - 4); g.lineTo(half - 16, half - 4);
+        g.stroke();
 
         if (t.type === PipeType.EMPTY) return;
 
-        // pick pipe colour
+        // pick pipe colour, then derive a darker casing + lighter gloss from it
         let col = this.C_PIPE;
         if (t.type === PipeType.START) col = this.C_START;
         else if (t.type === PipeType.GOAL) col = this.C_GOAL;
         else if (lit) col = this.C_PIPE_ON;
+        const casing = this.shade(col, 0.55);   // dark outline
+        const gloss = this.shade(col, 1.45);    // bright highlight
 
-        // draw the base-mask openings as thick rounded arms from centre.
         // We draw the BASE mask because the node itself is rotated via node.angle.
         const mask = t.baseMask;
-        g.lineWidth = 30;
-        g.lineCap = Graphics.LineCap.ROUND;
-        g.strokeColor = col;
-        const reach = half - 8;
-        if (mask & UP)    { g.moveTo(0, 0); g.lineTo(0, reach); }
-        if (mask & RIGHT) { g.moveTo(0, 0); g.lineTo(reach, 0); }
-        if (mask & DOWN)  { g.moveTo(0, 0); g.lineTo(0, -reach); }
-        if (mask & LEFT)  { g.moveTo(0, 0); g.lineTo(-reach, 0); }
-        g.stroke();
+        // Reach to the MIDPOINT of the gap between tiles. Two connected pipes then
+        // extend to the same line and meet flush -> one continuous, realistic tube.
+        const R = this.PITCH / 2;
+        const DIRS = [
+            { bit: UP, x: 0, y: 1 }, { bit: RIGHT, x: 1, y: 0 },
+            { bit: DOWN, x: 0, y: -1 }, { bit: LEFT, x: -1, y: 0 },
+        ];
+        const open = DIRS.filter(d => (mask & d.bit) !== 0);
+        const isStraight = (mask === (UP | DOWN) || mask === (LEFT | RIGHT));
+        const isElbow = (open.length === 2 && !isStraight);
 
-        // centre hub
-        g.fillColor = col;
-        g.circle(0, 0, 20);
-        g.fill();
+        const WC = 42, WB = 30, WG = 7;          // casing / body / gloss widths
+        const gi = R - 24;                       // gloss highlight stops short of the joint
+
+        if (isStraight) {
+            // one continuous tube straight across; flat ends meet the neighbour flush
+            const a = open[0], b = open[1];
+            const body = () => { g.moveTo(a.x * R, a.y * R); g.lineTo(b.x * R, b.y * R); };
+            this.strokeShape(g, casing, WC, false, body);
+            this.strokeShape(g, col, WB, false, body);
+            this.strokeShape(g, gloss, WG, true, () => {
+                g.moveTo(a.x * gi, a.y * gi); g.lineTo(b.x * gi, b.y * gi);
+            });
+        } else if (isElbow) {
+            // smooth quarter-bend; flat ends align with the neighbouring straight tubes
+            const a = open[0], b = open[1];
+            const body = () => { g.moveTo(a.x * R, a.y * R); g.quadraticCurveTo(0, 0, b.x * R, b.y * R); };
+            this.strokeShape(g, casing, WC, false, body);
+            this.strokeShape(g, col, WB, false, body);
+            this.strokeShape(g, gloss, WG, true, () => {
+                g.moveTo(a.x * gi, a.y * gi); g.quadraticCurveTo(0, 0, b.x * gi, b.y * gi);
+            });
+        } else {
+            // single arm (start / goal) or a junction: arms out from centre
+            const body = () => { for (const d of open) { g.moveTo(0, 0); g.lineTo(d.x * R, d.y * R); } };
+            this.strokeShape(g, casing, WC, false, body);
+            this.strokeShape(g, col, WB, false, body);
+            this.strokeShape(g, gloss, WG, true, () => {
+                for (const d of open) { g.moveTo(0, 0); g.lineTo(d.x * gi, d.y * gi); }
+            });
+            if (open.length >= 3) {              // junction joint
+                g.fillColor = casing; g.circle(0, 0, 22); g.fill();
+                g.fillColor = col; g.circle(0, 0, 16); g.fill();
+            }
+        }
+
+        // start / goal get a defined valve fitting with a glossy highlight
+        if (t.type === PipeType.START || t.type === PipeType.GOAL) {
+            g.fillColor = casing; g.circle(0, 0, 24); g.fill();
+            g.fillColor = col; g.circle(0, 0, 18); g.fill();
+            g.fillColor = gloss; g.circle(-5, 5, 6); g.fill();
+        }
 
         // labels for start / goal
         if (t.type === PipeType.START || t.type === PipeType.GOAL) {
